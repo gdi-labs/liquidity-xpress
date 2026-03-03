@@ -1,0 +1,25 @@
+module Integration where
+
+import Processor
+import Instruction
+
+template Integration
+  with
+    processorOperator : Party
+    user : Party
+    processorCid : ContractId ProcessorConfig
+  where
+    signatory processorOperator
+    observer user
+
+    -- User calls this; integration contract calls Processor.ExecuteOnBehalfOf(user, ...).
+    nonconsuming choice RunInstruction : ExecutionResult
+      with
+        instruction : PocaInstruction
+        stepContexts : [StepContext]
+      controller user
+      do
+        exercise processorCid (ExecuteOnBehalfOf with
+          actingParty = user
+          instruction = instruction
+          stepContexts = stepContexts)

@@ -1,0 +1,48 @@
+module Registry where
+
+data ActionType
+  = ClaimUSDCx
+  | DepositToPool
+  deriving (Eq, Show)
+
+data RegistryEntry = RegistryEntry
+  with
+    target : Text
+    selector : Text
+    actionType : ActionType
+  deriving (Eq, Show)
+
+lookupAction : [RegistryEntry] -> Text -> Text -> Optional ActionType
+lookupAction [] _ _ = None
+lookupAction (entry :: rest) t s
+  | entry.target == t && entry.selector == s = Some entry.actionType
+  | otherwise = lookupAction rest t s
+
+template Registry
+  with
+    owner : Party
+    entries : [RegistryEntry]
+  where
+    signatory owner
+
+    nonconsuming choice Lookup : Optional ActionType
+      with
+        target : Text
+        selector : Text
+      controller owner
+      do pure (lookupAction entries target selector)
+
+    choice AddEntry : ContractId Registry
+      with
+        entry : RegistryEntry
+      controller owner
+      do create this with entries = entry :: entries
+
+    choice RemoveEntry : ContractId Registry
+      with
+        target : Text
+        selector : Text
+      controller owner
+      do
+        let keep e = not (e.target == target && e.selector == selector)
+        create this with entries = filter keep entries

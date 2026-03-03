@@ -1,0 +1,185 @@
+module Test where
+
+import Daml.Script
+import Instruction
+import Registry
+import Processor
+import AdapterCCTPReceive
+
+validPayloadHashFormat : Text
+validPayloadHashFormat = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+testInstructionValidation : Script ()
+testInstructionValidation = script do
+  let validInstr = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 0
+                target = "t", selector = "s", value = 0
+            ]
+          inputs = ["input"]
+
+  assert (verifyInstruction validInstr)
+
+  let badLength = validInstr with
+        header = validInstr.header with length = 5
+  assert (not (verifyInstruction badLength))
+
+  let emptyHash = validInstr with
+        header = validInstr.header with payloadHash = ""
+  assert (not (verifyInstruction emptyHash))
+
+  let mismatchedInputs = validInstr with
+        payload = validInstr.payload with inputs = ["a", "b"]
+  assert (not (verifyInstruction mismatchedInputs))
+
+  let badHashFormat = validInstr with
+        header = validInstr.header with payloadHash = "0xshort"
+  assert (not (verifyInstruction badHashFormat))
+  pure ()
+
+testCrossChainStep : Script ()
+testCrossChainStep = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  relayerParty   <- allocateParty "Relayer"
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = []
+      allowedUsers = [processorOwner]
+
+  let instruction = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = "0x00000000000000000000000000000000000000000000000000000000000000aa"
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 100
+                target = "evm-processor", selector = "execute0"
+                value = 500
+            ]
+          inputs = ["0xdeadbeef"]
+
+  result <- submit processorOwner do
+    exerciseCmd processorCid
+      (Execute with
+        instruction = instruction
+        stepContexts = [SendCtx])
+
+  assertMsg "Should not complete (cross-chain)" (not result.completed)
+  assertMsg "Should stop at seq 0" (result.stoppedAtSeq == 0)
+  pure ()
+
+testBridgeExecution : Script ()
+testBridgeExecution = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  relayerParty   <- allocateParty "Relayer"
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = []
+      allowedUsers = [processorOwner]
+
+  let instruction = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 0
+                target = "t", selector = "s", value = 0
+            ]
+          inputs = [""]
+
+  result <- submit relayerParty do
+    exerciseCmd processorCid
+      (ExecuteFromBridge with
+        caller = relayerParty
+        instruction = instruction
+        stepContexts = [SendCtx]
+        sourceAddress = "0x1234abcd"
+        sourceChain = 1)
+
+  assertMsg "Bridge call should not complete (cross-chain)" (not result.completed)
+  pure ()
+
+testReceiveAdapterFlow : Script ()
+testReceiveAdapterFlow = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  relayerParty   <- allocateParty "Relayer"
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = []
+      allowedUsers = [processorOwner]
+
+  adapterCid <- submit relayerParty do
+    createCmd CCTPReceiveAdapter with
+      receiveAdapterParty = relayerParty
+      processorOwner = processorOwner
+
+  let instruction = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 0
+                target = "t", selector = "s", value = 0
+            ]
+          inputs = [""]
+
+  result <- submit relayerParty do
+    exerciseCmd adapterCid
+      (ReceiveAndExecute with
+        processorCid = processorCid
+        instruction = instruction
+        stepContexts = [SendCtx]
+        sourceAddress = "0xsource"
+        sourceChain = 1
+        amountUsdcReceived = 500.0)
+
+  assertMsg "Receive adapter call should not complete (cross-chain)" (not result.completed)
+  pure ()
+
+testRegistryLookup : Script ()
+testRegistryLookup = script do
+  owner <- allocateParty "RegistryOwner"
+
+  let entries =
+        [ RegistryEntry with
+            target = "target-a", selector = "sel-a", actionType = ClaimUSDCx
+        , RegistryEntry with
+            target = "target-b", selector = "sel-b", actionType = DepositToPool
+        ]
+
+  registryCid <- submit owner do
+    createCmd Registry with owner = owner, entries = entries
+
+  r1 <- submit owner do
+    exerciseCmd registryCid (Lookup with target = "target-a", selector = "sel-a")
+  assertMsg "Should find ClaimUSDCx" (r1 == Some ClaimUSDCx)
+
+  r2 <- submit owner do
+    exerciseCmd registryCid (Lookup with target = "target-b", selector = "sel-b")
+  assertMsg "Should find DepositToPool" (r2 == Some DepositToPool)
+
+  r3 <- submit owner do
+    exerciseCmd registryCid (Lookup with target = "unknown", selector = "unknown")
+  assertMsg "Should return None for unknown" (r3 == None)
+
+  pure ()

@@ -1,0 +1,170 @@
+module Processor where
+
+import DA.Optional (fromOptional)
+import DA.List ((!!))
+
+import Instruction
+import Registry
+import Interfaces
+import AdapterCCTPSend
+
+data StepContext
+  = ClaimCtx with attestCid : ContractId IClaimableAttestation; mintTo : Party
+  | DepositCtx with poolCid : ContractId IDepositPool; depositAmount : Decimal
+  | SendCtx
+  deriving (Eq, Show)
+
+data ExecutionResult = ExecutionResult
+  with
+    completed : Bool
+    stoppedAtSeq : Int
+  deriving (Eq, Show)
+
+processSteps :
+  Party -> Party -> Int -> [RegistryEntry] -> PocaInstruction -> [StepContext]
+  -> Optional (ContractId IHolding)
+  -> Update ExecutionResult
+processSteps owner relayer cantonChain registry instr contexts holdingOpt = do
+  if isComplete instr
+    then pure (ExecutionResult with completed = True, stoppedAtSeq = instr.header.seq)
+    else do
+      let idx = instr.header.seq
+      case currentOperation instr of
+        None -> abort ("No operation at seq " <> show idx)
+        Some op -> do
+          if op.chain == cantonChain
+            then dispatchLocal owner relayer cantonChain registry instr contexts holdingOpt idx op
+            else dispatchCrossChain owner relayer instr idx op
+
+dispatchLocal :
+  Party -> Party -> Int -> [RegistryEntry] -> PocaInstruction -> [StepContext]
+  -> Optional (ContractId IHolding) -> Int -> Operation
+  -> Update ExecutionResult
+dispatchLocal owner relayer cantonChain registry instr contexts holdingOpt idx op = do
+  case lookupAction registry op.target op.selector of
+    None -> abort ("Registry miss: target=" <> op.target <> " selector=" <> op.selector)
+    Some ClaimUSDCx -> do
+      let ctx = contexts !! idx
+      case ctx of
+        ClaimCtx attestCid mintTo -> do
+          newHoldingCid <- exercise attestCid (Mint with mintTo = mintTo)
+          processSteps owner relayer cantonChain registry
+            (advanceInstruction instr) contexts (Some newHoldingCid)
+        _ -> abort "Expected ClaimCtx for ClaimUSDCx action"
+    Some DepositToPool -> do
+      let ctx = contexts !! idx
+      case ctx of
+        DepositCtx poolCid depositAmount -> do
+          case holdingOpt of
+            None -> abort "No holding available for deposit"
+            Some holdingCid -> do
+              _ <- exercise poolCid
+                (Deposit with
+                  depositor = owner
+                  holdingCid = holdingCid
+                  depositAmount = depositAmount)
+              processSteps owner relayer cantonChain registry
+                (advanceInstruction instr) contexts None
+        _ -> abort "Expected DepositCtx for DepositToPool action"
+
+dispatchCrossChain :
+  Party -> Party -> PocaInstruction -> Int -> Operation
+  -> Update ExecutionResult
+dispatchCrossChain owner relayer instr idx op = do
+  let input = fromOptional "" (currentInput instr)
+  _ <- create CCTPSendRequest with
+    processor = owner
+    relayer = relayer
+    instructionPayloadHash = instr.header.payloadHash
+    currentSeq = idx
+    destinationChain = op.chain
+    amb = op.amb
+    fee = op.fee
+    value = op.value
+    targetHex = op.target
+    selectorHex = op.selector
+    inputData = input
+  pure (ExecutionResult with completed = False, stoppedAtSeq = idx)
+
+template ProcessorConfig
+  with
+    owner : Party
+    cantonChainIndex : Int
+    authorizedEndpoints : [Party]
+    cctpReceiveAdapter : Party
+    relayer : Party
+    registryEntries : [RegistryEntry]
+    allowedUsers : [Party]
+  where
+    signatory owner
+    observer cctpReceiveAdapter :: authorizedEndpoints ++ allowedUsers
+
+    nonconsuming choice Execute : ExecutionResult
+      with
+        instruction : PocaInstruction
+        stepContexts : [StepContext]
+      controller owner
+      do
+        assertMsg "Invalid instruction" (verifyInstruction instruction)
+        processSteps owner relayer cantonChainIndex registryEntries
+          instruction stepContexts None
+
+    -- Any allowed user (acting party) can call this; used when User → Integration → Processor.
+    -- Orchestrates claim/deposit in a single transaction on behalf of actingParty.
+    nonconsuming choice ExecuteOnBehalfOf : ExecutionResult
+      with
+        actingParty : Party
+        instruction : PocaInstruction
+        stepContexts : [StepContext]
+      controller actingParty
+      do
+        assertMsg "Acting party must be allowed to use processor" (actingParty `elem` allowedUsers)
+        assertMsg "Invalid instruction" (verifyInstruction instruction)
+        processSteps actingParty relayer cantonChainIndex registryEntries
+          instruction stepContexts None
+
+    nonconsuming choice ExecuteFromBridge : ExecutionResult
+      with
+        caller : Party
+        instruction : PocaInstruction
+        stepContexts : [StepContext]
+        sourceAddress : Text
+        sourceChain : Int
+      controller caller
+      do
+        assertMsg "Unauthorized bridge caller" (caller `elem` authorizedEndpoints)
+        assertMsg "Invalid instruction" (verifyInstruction instruction)
+        processSteps owner relayer cantonChainIndex registryEntries
+          instruction stepContexts None
+
+    nonconsuming choice ExecuteFromBridgeWithAmount : ExecutionResult
+      with
+        instruction : PocaInstruction
+        stepContexts : [StepContext]
+        sourceAddress : Text
+        sourceChain : Int
+        amountUsdcReceived : Decimal
+      controller cctpReceiveAdapter
+      do
+        assertMsg "Invalid instruction" (verifyInstruction instruction)
+        assertMsg "Amount must be positive" (amountUsdcReceived > 0.0)
+        processSteps owner relayer cantonChainIndex registryEntries
+          instruction stepContexts None
+
+    choice UpdateRegistry : ContractId ProcessorConfig
+      with
+        newEntries : [RegistryEntry]
+      controller owner
+      do create this with registryEntries = newEntries
+
+    choice UpdateAuthorizedEndpoints : ContractId ProcessorConfig
+      with
+        newEndpoints : [Party]
+      controller owner
+      do create this with authorizedEndpoints = newEndpoints
+
+    choice UpdateAllowedUsers : ContractId ProcessorConfig
+      with
+        newAllowedUsers : [Party]
+      controller owner
+      do create this with allowedUsers = newAllowedUsers

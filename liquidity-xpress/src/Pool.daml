@@ -1,0 +1,70 @@
+module Pool where
+
+import qualified Interfaces as POCA
+import USDCx
+
+template PoolShare
+  with
+    owner : Party
+    poolOperator : Party
+    poolId : Text
+    shares : Decimal
+  where
+    signatory poolOperator
+    observer owner
+
+    interface instance POCA.IShare for PoolShare where
+      view = POCA.IShareView with owner = owner
+
+template PoolConfig
+  with
+    operator : Party
+    poolId : Text
+    totalDeposits : Decimal
+    totalShares : Decimal
+    allowedDepositors : [Party]
+  where
+    signatory operator
+    observer allowedDepositors
+
+    interface instance POCA.IDepositPool for PoolConfig where
+      view = POCA.IDepositPoolView with operator = operator
+      performDeposit depositor holdingCid depositAmount = do
+        exercise holdingCid (POCA.Consume with)
+        let newShares = depositAmount
+        newPoolCid <- create this with
+          totalDeposits = totalDeposits + depositAmount
+          totalShares = totalShares + newShares
+        shareCid <- create PoolShare with
+          owner = depositor
+          poolOperator = operator
+          poolId
+          shares = newShares
+        pure (toInterfaceContractId newPoolCid, toInterfaceContractId shareCid)
+
+    choice Deposit : (ContractId PoolConfig, ContractId PoolShare)
+      with
+        depositor : Party
+        usdcxCid : ContractId USDCxHolding
+        depositAmount : Decimal
+      controller depositor
+      do
+        holding <- fetch usdcxCid
+        assertMsg "Deposit amount exceeds USDCx balance" (holding.amount >= depositAmount)
+        exercise usdcxCid Consume
+        let newShares = depositAmount
+        newPoolCid <- create this with
+          totalDeposits = totalDeposits + depositAmount
+          totalShares = totalShares + newShares
+        shareCid <- create PoolShare with
+          owner = depositor
+          poolOperator = operator
+          poolId
+          shares = newShares
+        pure (newPoolCid, shareCid)
+
+    choice UpdateAllowedDepositors : ContractId PoolConfig
+      with
+        newAllowed : [Party]
+      controller operator
+      do create this with allowedDepositors = newAllowed

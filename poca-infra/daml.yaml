@@ -1,0 +1,9 @@
+sdk-version: 3.4.11
+name: poca-infra
+version: 0.1.0
+source: src
+build-options:
+  - -Wno-upgrade-interfaces
+dependencies:
+  - daml-prim
+  - daml-stdlib

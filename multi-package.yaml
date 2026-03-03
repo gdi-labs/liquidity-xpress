@@ -1,0 +1,5 @@
+packages:
+  - ./poca-infra
+  - ./liquidity-xpress
+  - ./tests/poca-infra-tests
+  - ./tests/liquidity-xpress-tests

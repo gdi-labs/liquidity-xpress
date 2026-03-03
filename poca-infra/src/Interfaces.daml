@@ -1,0 +1,39 @@
+module Interfaces where
+
+data IHoldingView = IHoldingView with consumeController : Party
+
+interface IHolding where
+  viewtype IHoldingView
+  choice Consume : ()
+    controller (view this).consumeController
+    do pure ()
+
+data IClaimableAttestationView = IClaimableAttestationView with mintController : Party
+
+interface IClaimableAttestation where
+  viewtype IClaimableAttestationView
+  performMint : Party -> Update (ContractId IHolding)
+  choice Mint : ContractId IHolding
+    with mintTo : Party
+    controller (view this).mintController
+    do (performMint this mintTo)
+
+data IDepositPoolView = IDepositPoolView with
+  operator : Party
+
+interface IDepositPool where
+  viewtype IDepositPoolView
+  performDeposit : Party -> ContractId IHolding -> Decimal -> Update (ContractId IDepositPool, ContractId IShare)
+  choice Deposit : (ContractId IDepositPool, ContractId IShare)
+    with
+      depositor : Party
+      holdingCid : ContractId IHolding
+      depositAmount : Decimal
+    controller depositor
+    do (performDeposit this depositor holdingCid depositAmount)
+
+data IShareView = IShareView with
+  owner : Party
+
+interface IShare where
+  viewtype IShareView

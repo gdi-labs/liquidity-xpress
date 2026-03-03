@@ -1,0 +1,90 @@
+module Instruction where
+
+import DA.Text as Text
+import Prelude
+import qualified Prelude as P
+
+hexDigits : Text
+hexDigits = "0123456789abcdefABCDEF"
+
+isPayloadHashFormat : Text -> Bool
+isPayloadHashFormat t =
+  let prefix = Text.take 2 t
+      stripped = if prefix == "0x" || prefix == "0X" then Text.drop 2 t else t
+      isHex c = Text.isInfixOf c hexDigits
+  in Text.length stripped == 64 && all isHex (Text.explode stripped)
+
+data Header = Header
+  with
+    seq : Int
+    length : Int
+    payloadHash : Text
+  deriving (Eq, Show)
+
+data Operation = Operation
+  with
+    chain : Int
+    amb : Int
+    fee : Int
+    target : Text
+    selector : Text
+    value : Int
+  deriving (Eq, Show)
+
+data Payload = Payload
+  with
+    operations : [Operation]
+    inputs : [Text]
+  deriving (Eq, Show)
+
+data PocaInstruction = PocaInstruction
+  with
+    header : Header
+    payload : Payload
+  deriving (Eq, Show)
+
+
+
+
+verifyInstruction : PocaInstruction -> Bool
+verifyInstruction instr =
+  let h = instr.header
+      p = instr.payload
+      numOps = P.length p.operations
+  in  h.seq >= 0
+   && h.length > 0
+   && h.length == numOps
+   && P.length p.inputs == numOps
+   && h.payloadHash /= ""
+   && isPayloadHashFormat h.payloadHash
+
+
+index0 : [a] -> Int -> Optional a
+index0 list n =
+  let rest = P.drop n list
+  in case rest of
+       (x :: xs) -> Some x
+       [] -> None
+
+currentOperation : PocaInstruction -> Optional Operation
+currentOperation instr =
+  let idx = instr.header.seq
+      ops = instr.payload.operations
+  in if idx >= 0 && idx < P.length ops
+     then index0 ops idx
+     else None
+
+currentInput : PocaInstruction -> Optional Text
+currentInput instr =
+  let idx = instr.header.seq
+      ins = instr.payload.inputs
+  in if idx >= 0 && idx < P.length ins
+     then index0 ins idx
+     else None
+
+advanceInstruction : PocaInstruction -> PocaInstruction
+advanceInstruction instr =
+  instr with header = instr.header with seq = instr.header.seq + 1
+
+isComplete : PocaInstruction -> Bool
+isComplete instr = instr.header.seq >= instr.header.length

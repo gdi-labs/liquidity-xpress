@@ -1,0 +1,8 @@
+sdk-version: 3.4.11
+name: liquidity-xpress
+version: 0.1.0
+source: src
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - ../poca-infra/.daml/dist/poca-infra-0.1.0.dar

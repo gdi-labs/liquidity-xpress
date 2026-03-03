@@ -1,0 +1,88 @@
+module USDCx where
+
+import DA.Text as Text
+
+import qualified Interfaces as POCA
+
+hexDigits : Text
+hexDigits = "0123456789abcdefABCDEF"
+
+isMessageHashFormat : Text -> Bool
+isMessageHashFormat t =
+  let prefix = Text.take 2 t
+      stripped = if prefix == "0x" || prefix == "0X" then Text.drop 2 t else t
+      isHex c = Text.isInfixOf c hexDigits
+  in Text.length stripped == 64 && all isHex (Text.explode stripped)
+
+template USDCxHolding
+  with
+    owner : Party
+    custodian : Party
+    amount : Decimal
+    holdingId : Text
+  where
+    signatory custodian
+    observer owner
+
+    interface instance POCA.IHolding for USDCxHolding where
+      view = POCA.IHoldingView with consumeController = owner
+
+    choice Transfer : ContractId USDCxHolding
+      with
+        newOwner : Party
+      controller owner
+      do create this with owner = newOwner
+
+    choice Split : (ContractId USDCxHolding, ContractId USDCxHolding)
+      with
+        splitAmount : Decimal
+        newIdA : Text
+        newIdB : Text
+      controller owner
+      do
+        assertMsg "Split amount must be positive and within balance"
+          (splitAmount > 0.0 && splitAmount <= amount)
+        cidA <- create this with amount = splitAmount, holdingId = newIdA
+        cidB <- create this with amount = amount - splitAmount, holdingId = newIdB
+        pure (cidA, cidB)
+
+    choice Consume : ()
+      controller owner
+      do pure ()
+
+template DepositAttestation
+  with
+    xReserveOperator : Party
+    beneficiary : Party
+    attestationId : Text
+    usdcAmount : Decimal
+    sourceChain : Text
+    depositTxHash : Text
+    hookDataHex : Optional Text
+    remoteRecipientHex : Optional Text
+  where
+    signatory xReserveOperator
+    observer beneficiary
+
+    ensure isMessageHashFormat attestationId
+
+    interface instance POCA.IClaimableAttestation for DepositAttestation where
+      view = POCA.IClaimableAttestationView with mintController = beneficiary
+      performMint mintTo = do
+        cid <- create USDCxHolding with
+          owner = mintTo
+          custodian = xReserveOperator
+          amount = usdcAmount
+          holdingId = "usdcx-" <> attestationId
+        pure (toInterfaceContractId cid)
+
+    choice Mint : ContractId USDCxHolding
+      with
+        mintTo : Party
+      controller beneficiary
+      do
+        create USDCxHolding with
+          owner = mintTo
+          custodian = xReserveOperator
+          amount = usdcAmount
+          holdingId = "usdcx-" <> attestationId

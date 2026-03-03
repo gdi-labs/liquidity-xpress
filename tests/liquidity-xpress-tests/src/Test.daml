@@ -1,0 +1,459 @@
+module Test where
+
+import Daml.Script
+import Instruction
+import Registry
+import USDCx
+import Pool
+import Processor
+import Integration
+import AdapterCCTPReceive
+
+validMessageHashFormat : Text
+validMessageHashFormat = "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+validPayloadHashFormat : Text
+validPayloadHashFormat = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+testTwoStepLocalExecution : Script ()
+testTwoStepLocalExecution = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  xReserveOp     <- allocateParty "xReserveOperator"
+  poolOp         <- allocateParty "PoolOperator"
+  relayerParty   <- allocateParty "Relayer"
+
+  attestationCid <- submit xReserveOp do
+    createCmd DepositAttestation with
+      xReserveOperator = xReserveOp
+      beneficiary = processorOwner
+      attestationId = validMessageHashFormat
+      usdcAmount = 1000.0
+      sourceChain = "ethereum"
+      depositTxHash = "0xabc123def456"
+      hookDataHex = None
+      remoteRecipientHex = None
+
+  poolCid <- submit poolOp do
+    createCmd PoolConfig with
+      operator = poolOp
+      poolId = "canton-usdc-pool-1"
+      totalDeposits = 0.0
+      totalShares = 0.0
+      allowedDepositors = [processorOwner]
+
+  let registryEntries =
+        [ RegistryEntry with
+            target = "xreserve-mint-target"
+            selector = "mint0000"
+            actionType = ClaimUSDCx
+        , RegistryEntry with
+            target = "pool-deposit-target"
+            selector = "deposit0"
+            actionType = DepositToPool
+        ]
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = registryEntries
+      allowedUsers = [processorOwner]
+
+  let instruction = PocaInstruction with
+        header = Header with
+          seq = 0
+          length = 2
+          payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 3, amb = 0, fee = 0
+                target = "xreserve-mint-target"
+                selector = "mint0000", value = 0
+            , Operation with
+                chain = 3, amb = 0, fee = 0
+                target = "pool-deposit-target"
+                selector = "deposit0", value = 0
+            ]
+          inputs = ["", ""]
+
+  let stepContexts =
+        [ ClaimCtx with attestCid = toInterfaceContractId attestationCid; mintTo = processorOwner
+        , DepositCtx with poolCid = toInterfaceContractId poolCid; depositAmount = 1000.0
+        ]
+
+  result <- submit processorOwner do
+    exerciseCmd processorCid
+      (Execute with
+        instruction = instruction
+        stepContexts = stepContexts)
+
+  assertMsg "Execution should complete" result.completed
+  assertMsg "Should process all steps" (result.stoppedAtSeq == 2)
+  pure ()
+
+testLedgerStateAfterTwoStepExecution : Script ()
+testLedgerStateAfterTwoStepExecution = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  xReserveOp     <- allocateParty "xReserveOperator"
+  poolOp         <- allocateParty "PoolOperator"
+  relayerParty   <- allocateParty "Relayer"
+
+  attestationCid <- submit xReserveOp do
+    createCmd DepositAttestation with
+      xReserveOperator = xReserveOp
+      beneficiary = processorOwner
+      attestationId = validMessageHashFormat
+      usdcAmount = 500.0
+      sourceChain = "ethereum"
+      depositTxHash = "0xabc123"
+      hookDataHex = None
+      remoteRecipientHex = None
+
+  poolCid <- submit poolOp do
+    createCmd PoolConfig with
+      operator = poolOp
+      poolId = "verify-pool"
+      totalDeposits = 0.0
+      totalShares = 0.0
+      allowedDepositors = [processorOwner]
+
+  let registryEntries =
+        [ RegistryEntry with
+            target = "xreserve-mint-target"
+            selector = "mint0000"
+            actionType = ClaimUSDCx
+        , RegistryEntry with
+            target = "pool-deposit-target"
+            selector = "deposit0"
+            actionType = DepositToPool
+        ]
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = registryEntries
+      allowedUsers = [processorOwner]
+
+  let instruction = PocaInstruction with
+        header = Header with seq = 0, length = 2, payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 3, amb = 0, fee = 0
+                target = "xreserve-mint-target"
+                selector = "mint0000", value = 0
+            , Operation with
+                chain = 3, amb = 0, fee = 0
+                target = "pool-deposit-target"
+                selector = "deposit0", value = 0
+            ]
+          inputs = ["", ""]
+
+  let stepContexts =
+        [ ClaimCtx with attestCid = toInterfaceContractId attestationCid; mintTo = processorOwner
+        , DepositCtx with poolCid = toInterfaceContractId poolCid; depositAmount = 500.0
+        ]
+
+  _ <- submit processorOwner do
+    exerciseCmd processorCid
+      (Execute with
+        instruction = instruction
+        stepContexts = stepContexts)
+
+  shareContracts <- queryFilter processorOwner (\(s : PoolShare) -> s.owner == processorOwner && s.poolId == "verify-pool" && s.shares == 500.0)
+  assertMsg "Ledger must have at least one PoolShare (deposit created it)" (Prelude.length shareContracts >= 1)
+
+  poolContracts <- queryFilter poolOp (\(p : PoolConfig) -> p.poolId == "verify-pool" && p.totalDeposits == 500.0)
+  assertMsg "PoolConfig totalDeposits must be updated" (Prelude.length poolContracts >= 1)
+
+  pure ()
+
+testUserViaIntegrationCallsProcessor : Script ()
+testUserViaIntegrationCallsProcessor = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  user           <- allocateParty "User"
+  xReserveOp     <- allocateParty "xReserveOperator"
+  poolOp         <- allocateParty "PoolOperator"
+  relayerParty   <- allocateParty "Relayer"
+
+  attestationCid <- submit xReserveOp do
+    createCmd DepositAttestation with
+      xReserveOperator = xReserveOp
+      beneficiary = user
+      attestationId = "0x0000000000000000000000000000000000000000000000000000000000000002"
+      usdcAmount = 500.0
+      sourceChain = "ethereum"
+      depositTxHash = "0xdef789"
+      hookDataHex = None
+      remoteRecipientHex = None
+
+  poolCid <- submit poolOp do
+    createCmd PoolConfig with
+      operator = poolOp
+      poolId = "canton-usdc-pool-2"
+      totalDeposits = 0.0
+      totalShares = 0.0
+      allowedDepositors = [user]
+
+  let registryEntries =
+        [ RegistryEntry with
+            target = "xreserve-mint-target"
+            selector = "mint0000"
+            actionType = ClaimUSDCx
+        , RegistryEntry with
+            target = "pool-deposit-target"
+            selector = "deposit0"
+            actionType = DepositToPool
+        ]
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = registryEntries
+      allowedUsers = [user]
+
+  integrationCid <- submit processorOwner do
+    createCmd Integration with
+      processorOperator = processorOwner
+      user = user
+      processorCid = processorCid
+
+  let instruction = PocaInstruction with
+        header = Header with
+          seq = 0
+          length = 2
+          payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 3, amb = 0, fee = 0
+                target = "xreserve-mint-target"
+                selector = "mint0000", value = 0
+            , Operation with
+                chain = 3, amb = 0, fee = 0
+                target = "pool-deposit-target"
+                selector = "deposit0", value = 0
+            ]
+          inputs = ["", ""]
+
+  let stepContexts =
+        [ ClaimCtx with attestCid = toInterfaceContractId attestationCid; mintTo = user
+        , DepositCtx with poolCid = toInterfaceContractId poolCid; depositAmount = 500.0
+        ]
+
+  result <- submit user do
+    exerciseCmd integrationCid
+      (RunInstruction with
+        instruction = instruction
+        stepContexts = stepContexts)
+
+  assertMsg "Execution should complete" result.completed
+  assertMsg "Should process all steps" (result.stoppedAtSeq == 2)
+  pure ()
+
+
+testInstructionValidation : Script ()
+testInstructionValidation = script do
+  let validInstr = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 0
+                target = "t", selector = "s", value = 0
+            ]
+          inputs = ["input"]
+
+  assert (verifyInstruction validInstr)
+
+  let badLength = validInstr with
+        header = validInstr.header with length = 5
+  assert (not (verifyInstruction badLength))
+
+  let emptyHash = validInstr with
+        header = validInstr.header with payloadHash = ""
+  assert (not (verifyInstruction emptyHash))
+
+  let mismatchedInputs = validInstr with
+        payload = validInstr.payload with inputs = ["a", "b"]
+  assert (not (verifyInstruction mismatchedInputs))
+
+  let badHashFormat = validInstr with
+        header = validInstr.header with payloadHash = "0xshort"
+  assert (not (verifyInstruction badHashFormat))
+
+  pure ()
+
+testCrossChainStep : Script ()
+testCrossChainStep = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  relayerParty   <- allocateParty "Relayer"
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = []
+      allowedUsers = [processorOwner]
+
+  let instruction = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = "0x00000000000000000000000000000000000000000000000000000000000000aa"
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 100
+                target = "evm-processor", selector = "execute0"
+                value = 500
+            ]
+          inputs = ["0xdeadbeef"]
+
+  result <- submit processorOwner do
+    exerciseCmd processorCid
+      (Execute with
+        instruction = instruction
+        stepContexts = [SendCtx])
+
+  assertMsg "Should not complete (cross-chain)" (not result.completed)
+  assertMsg "Should stop at seq 0" (result.stoppedAtSeq == 0)
+  pure ()
+
+testBridgeExecution : Script ()
+testBridgeExecution = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  relayerParty   <- allocateParty "Relayer"
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = []
+      allowedUsers = [processorOwner]
+
+  let instruction = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 0
+                target = "t", selector = "s", value = 0
+            ]
+          inputs = [""]
+
+  result <- submit relayerParty do
+    exerciseCmd processorCid
+      (ExecuteFromBridge with
+        caller = relayerParty
+        instruction = instruction
+        stepContexts = [SendCtx]
+        sourceAddress = "0x1234abcd"
+        sourceChain = 1)
+
+  assertMsg "Bridge call should not complete (cross-chain)" (not result.completed)
+  pure ()
+
+testReceiveAdapterFlow : Script ()
+testReceiveAdapterFlow = script do
+  processorOwner <- allocateParty "ProcessorOwner"
+  relayerParty   <- allocateParty "Relayer"
+
+  processorCid <- submit processorOwner do
+    createCmd ProcessorConfig with
+      owner = processorOwner
+      cantonChainIndex = 3
+      authorizedEndpoints = [relayerParty]
+      cctpReceiveAdapter = relayerParty
+      relayer = relayerParty
+      registryEntries = []
+      allowedUsers = [processorOwner]
+
+  adapterCid <- submit relayerParty do
+    createCmd CCTPReceiveAdapter with
+      receiveAdapterParty = relayerParty
+      processorOwner = processorOwner
+
+  let instruction = PocaInstruction with
+        header = Header with seq = 0, length = 1, payloadHash = validPayloadHashFormat
+        payload = Payload with
+          operations =
+            [ Operation with
+                chain = 1, amb = 0, fee = 0
+                target = "t", selector = "s", value = 0
+            ]
+          inputs = [""]
+
+  result <- submit relayerParty do
+    exerciseCmd adapterCid
+      (ReceiveAndExecute with
+        processorCid = processorCid
+        instruction = instruction
+        stepContexts = [SendCtx]
+        sourceAddress = "0xsource"
+        sourceChain = 1
+        amountUsdcReceived = 500.0)
+
+  assertMsg "Receive adapter call should not complete (cross-chain)" (not result.completed)
+  pure ()
+
+testRegistryLookup : Script ()
+testRegistryLookup = script do
+  owner <- allocateParty "RegistryOwner"
+
+  let entries =
+        [ RegistryEntry with
+            target = "target-a", selector = "sel-a", actionType = ClaimUSDCx
+        , RegistryEntry with
+            target = "target-b", selector = "sel-b", actionType = DepositToPool
+        ]
+
+  registryCid <- submit owner do
+    createCmd Registry with owner = owner, entries = entries
+
+  r1 <- submit owner do
+    exerciseCmd registryCid (Lookup with target = "target-a", selector = "sel-a")
+  assertMsg "Should find ClaimUSDCx" (r1 == Some ClaimUSDCx)
+
+  r2 <- submit owner do
+    exerciseCmd registryCid (Lookup with target = "target-b", selector = "sel-b")
+  assertMsg "Should find DepositToPool" (r2 == Some DepositToPool)
+
+  r3 <- submit owner do
+    exerciseCmd registryCid (Lookup with target = "unknown", selector = "unknown")
+  assertMsg "Should return None for unknown" (r3 == None)
+
+  pure ()
+
+testDepositAttestationRejectsInvalidAttestationId : Script ()
+testDepositAttestationRejectsInvalidAttestationId = script do
+  xReserveOp   <- allocateParty "xReserveOperator"
+  beneficiary  <- allocateParty "Beneficiary"
+
+  submitMustFail xReserveOp do
+    createCmd DepositAttestation with
+      xReserveOperator = xReserveOp
+      beneficiary = beneficiary
+      attestationId = "att-001"
+      usdcAmount = 1000.0
+      sourceChain = "ethereum"
+      depositTxHash = "0xabc"
+      hookDataHex = None
+      remoteRecipientHex = None
+
+  pure ()

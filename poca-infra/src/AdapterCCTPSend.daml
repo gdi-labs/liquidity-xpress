@@ -1,0 +1,26 @@
+module AdapterCCTPSend where
+
+template CCTPSendRequest
+  with
+    processor : Party
+    relayer : Party
+    instructionPayloadHash : Text
+    currentSeq : Int
+    destinationChain : Int
+    amb : Int
+    fee : Int
+    value : Int
+    targetHex : Text
+    selectorHex : Text
+    inputData : Text
+  where
+    signatory processor
+    observer relayer
+
+    choice Fulfill : ()
+      controller relayer
+      do pure ()
+
+    choice Cancel : ()
+      controller processor
+      do pure ()

@@ -1,0 +1,30 @@
+module AdapterCCTPReceive where
+
+import Instruction
+import Processor
+
+template CCTPReceiveAdapter
+  with
+    receiveAdapterParty : Party
+    processorOwner : Party
+  where
+    signatory receiveAdapterParty
+    observer processorOwner
+
+    nonconsuming choice ReceiveAndExecute : ExecutionResult
+      with
+        processorCid : ContractId ProcessorConfig
+        instruction : PocaInstruction
+        stepContexts : [StepContext]
+        sourceAddress : Text
+        sourceChain : Int
+        amountUsdcReceived : Decimal
+      controller receiveAdapterParty
+      do
+        exercise processorCid
+          (ExecuteFromBridgeWithAmount with
+            instruction = instruction
+            stepContexts = stepContexts
+            sourceAddress = sourceAddress
+            sourceChain = sourceChain
+            amountUsdcReceived = amountUsdcReceived)

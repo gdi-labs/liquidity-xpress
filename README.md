@@ -1,4 +1,4 @@
-# POCA and liquidity-xpress on Canton
+# LiquidityXpress with POCA on Canton
 
 This repository contains:
 
@@ -12,7 +12,7 @@ This repository contains:
 
 - Daml SDK 3.4.11
 - Canton Network participant node for deployment
-- xReserve / USDCx (CIP-56) — mock templates in liquidity-xpress; replace with production DAR when available.
+- xReserve / USDCx (CIP-56)
 
 ## Build and test
 
